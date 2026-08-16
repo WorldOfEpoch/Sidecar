@@ -1,0 +1,65 @@
+# Build products and IDE state
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/.vs/
+/.vscode/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.sln
+*.vcxproj*
+*.user
+*.suo
+*.VC.db
+*.obj
+*.lib
+*.dll
+*.exe
+*.pdb
+
+# Models and ML artifacts
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.bin
+/models/
+/SidecarModels/
+
+# Runtime databases, traces, reports, and benchmark data
+/data/
+/traces/
+/reports/generated/
+/benchmarks/data/
+/SidecarData/
+*.db
+*.db-shm
+*.db-wal
+*.sctrace
+*.sidecartrace
+*.raw
+
+# External dependencies and caches
+/deps/
+/external/
+/third_party/build/
+/SidecarDeps/
+/.ollama/
+/.cache/huggingface/
+/.huggingface/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*.json
+*secrets*.json
+CMakeUserPresets.json
+

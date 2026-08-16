@@ -1,0 +1,16 @@
+#pragma once
+
+#include <string_view>
+
+namespace sidecar::database {
+
+inline constexpr std::string_view kMigration2Sql = R"sc_migration(@SIDECAR_MIGRATION_2_SQL@)sc_migration";
+inline constexpr std::string_view kMigration3Sql = R"sc_migration(@SIDECAR_MIGRATION_3_SQL@)sc_migration";
+inline constexpr std::string_view kMigration4Sql = R"sc_migration(@SIDECAR_MIGRATION_4_SQL@)sc_migration";
+inline constexpr std::string_view kMigration5Sql = R"sc_migration(@SIDECAR_MIGRATION_5_SQL@)sc_migration";
+inline constexpr std::string_view kMigration6Sql = R"sc_migration(@SIDECAR_MIGRATION_6_SQL@)sc_migration";
+inline constexpr std::string_view kMigration7Sql = R"sc_migration(@SIDECAR_MIGRATION_7_SQL@)sc_migration";
+inline constexpr std::string_view kMigration8Sql = R"sc_migration(@SIDECAR_MIGRATION_8_SQL@)sc_migration";
+inline constexpr std::string_view kMigration9Sql = R"sc_migration(@SIDECAR_MIGRATION_9_SQL@)sc_migration";
+
+}  // namespace sidecar::database

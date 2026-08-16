@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace sidecar::database {
+
+inline constexpr std::string_view kSchemaSql = R"sidecar_schema(@SIDECAR_SCHEMA_SQL@)sidecar_schema";
+
+}  // namespace sidecar::database
+
