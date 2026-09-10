@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #if SIDECAR_LLAMA_ENABLED
 #include <ggml.h>
@@ -40,18 +41,37 @@ struct Options {
     bool tensors{false};
     bool hash{true};
     bool authoritative{false};
+    bool dry_run{false};
+    bool sidecar_staging{false};
+    bool check_tensors{true};
+    bool tiny_fast{false};
     std::optional<std::string> supplied_sha256;
     std::uint32_t prompt{128};
     std::uint32_t generate{32};
     std::uint32_t context{4096};
-    std::uint32_t warmups{1};
+    bool context_specified{false};
+    std::uint32_t batch_size{0};
+    std::uint32_t threads{0};
+    std::uint32_t batch_threads{0};
+    bool offload_kqv{true};
+    bool op_offload{true};
+    // Two unmeasured passes stabilize CUDA graph/allocator state on the
+    // first request.  Additional passes did not provide a repeatable gain;
+    // callers can still override this with --warmups.
+    std::uint32_t warmups{2};
     std::uint32_t repetitions{1};
     std::int32_t gpu_layers{-1};
+    bool gpu_layers_specified{false};
     ObserverMode observer{ObserverMode::None};
     std::uint64_t causal_lead_ns{0};
     std::uint64_t oracle_lead_ns{0};
     std::uint64_t pipeline_ns{0};
     std::uint64_t block_size_bytes{kBlock64MiB};
+    std::uint64_t usable_vram_bytes{0};
+    std::uint64_t h2d_bytes_per_second{0};
+    std::uint64_t compute_window_ns{0};
+    std::uint64_t staging_lead_time_ns{0};
+    std::uint32_t assumed_active_experts_per_layer{0};
 };
 
 std::uint64_t ParseUnsigned(std::string_view text, std::string_view option) {
@@ -76,6 +96,10 @@ Options ParseOptions(int argc, char** argv, int begin) {
         else if (argument == "--tensors") options.tensors = true;
         else if (argument == "--no-hash") options.hash = false;
         else if (argument == "--authoritative") options.authoritative = true;
+        else if (argument == "--dry-run") options.dry_run = true;
+        else if (argument == "--sidecar-stage") options.sidecar_staging = true;
+        else if (argument == "--no-tensor-checks") options.check_tensors = false;
+        else if (argument == "--tiny-fast") options.tiny_fast = true;
         else if (argument == "--sha256") { options.supplied_sha256 = next(); options.hash = false; }
         else if (argument == "--source") options.provenance.source = next();
         else if (argument == "--source-repository") options.provenance.source_repository = next();
@@ -88,10 +112,21 @@ Options ParseOptions(int argc, char** argv, int begin) {
         else if (argument == "--copy-relationship") options.copy_relationship = next();
         else if (argument == "--prompt-tokens") options.prompt = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
         else if (argument == "--generate-tokens") options.generate = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
-        else if (argument == "--context") options.context = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
+        else if (argument == "--context") {
+            options.context = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
+            options.context_specified = true;
+        }
+        else if (argument == "--batch-size") options.batch_size = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
+        else if (argument == "--threads") options.threads = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
+        else if (argument == "--batch-threads") options.batch_threads = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
+        else if (argument == "--no-kqv-offload") options.offload_kqv = false;
+        else if (argument == "--no-op-offload") options.op_offload = false;
         else if (argument == "--warmups") options.warmups = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
         else if (argument == "--repetitions") options.repetitions = static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
-        else if (argument == "--gpu-layers") options.gpu_layers = std::stoi(next());
+        else if (argument == "--gpu-layers") {
+            options.gpu_layers = std::stoi(next());
+            options.gpu_layers_specified = true;
+        }
         else if (argument == "--observer") {
             const auto value = ParseObserverMode(next());
             if (!value) throw std::invalid_argument("unknown observer mode");
@@ -100,6 +135,12 @@ Options ParseOptions(int argc, char** argv, int begin) {
         else if (argument == "--oracle-lead-ns") options.oracle_lead_ns = ParseUnsigned(next(), argument);
         else if (argument == "--pipeline-ns") options.pipeline_ns = ParseUnsigned(next(), argument);
         else if (argument == "--block-bytes") options.block_size_bytes = ParseUnsigned(next(), argument);
+        else if (argument == "--usable-vram-bytes") options.usable_vram_bytes = ParseUnsigned(next(), argument);
+        else if (argument == "--h2d-bytes-per-second") options.h2d_bytes_per_second = ParseUnsigned(next(), argument);
+        else if (argument == "--compute-window-ns") options.compute_window_ns = ParseUnsigned(next(), argument);
+        else if (argument == "--staging-lead-ns") options.staging_lead_time_ns = ParseUnsigned(next(), argument);
+        else if (argument == "--active-experts-per-layer") options.assumed_active_experts_per_layer =
+            static_cast<std::uint32_t>(ParseUnsigned(next(), argument));
         else if (options.model.empty() && !argument.starts_with("--")) options.model = argument;
         else throw std::invalid_argument("invalid llama option: " + std::string(argument));
     }
@@ -513,6 +554,8 @@ ModelIndex Inspect(const Options& options, bool compute_hash) {
 InferenceConfiguration MakeConfiguration(const Options& options) {
     if (options.model.empty()) throw std::invalid_argument("--model <GGUF-path> is required");
     if (options.authoritative) {
+        if (!options.check_tensors)
+            throw std::invalid_argument("authoritative inference requires tensor checks");
         const auto storage = ResolveModelStorage(options.model, "PRIMARY_AUTHORITATIVE_DENSE",
                                                   "AUTHORITY_STORAGE_GATE");
         if (!storage.is_samsung_990_pro || storage.is_usb_external) {
@@ -525,11 +568,18 @@ InferenceConfiguration MakeConfiguration(const Options& options) {
     configuration.prompt_tokens = options.prompt;
     configuration.generated_tokens = options.generate;
     configuration.context_size = options.context;
+    configuration.batch_size = options.batch_size;
+    configuration.threads = options.threads;
+    configuration.batch_threads = options.batch_threads;
+    configuration.offload_kqv = options.offload_kqv;
+    configuration.op_offload = options.op_offload;
     configuration.gpu_layers = options.gpu_layers;
     configuration.warmups = options.warmups;
     configuration.repetitions = options.repetitions;
     configuration.observer_mode = options.observer;
     configuration.authoritative = options.authoritative;
+    configuration.sidecar_staging = options.sidecar_staging;
+    configuration.check_tensors = options.check_tensors;
     configuration.flight_recorder_path = options.trace;
     if (configuration.observer_mode == ObserverMode::LightLayerFlightRecorder) {
         auto provider = hardware::CreateNativeDiscoveryProvider();
@@ -566,6 +616,229 @@ std::string ProjectionJson(const ModelIndex& model,
     return output.str();
 }
 
+std::string FeasibilityToJson(const OversizedFeasibilityResult& result) {
+    std::ostringstream output;
+    output << "{\"status\":\"" << JsonEscape(result.status)
+           << "\",\"evidence_class\":\"" << JsonEscape(result.evidence_class)
+           << "\",\"is_moe\":" << (result.is_moe ? "true" : "false")
+           << ",\"requires_runtime_demand\":" << (result.requires_runtime_demand ? "true" : "false")
+           << ",\"persistent_weight_bytes\":" << result.persistent_weight_bytes
+           << ",\"usable_vram_bytes\":" << result.usable_vram_bytes
+           << ",\"resident_weight_bytes\":" << result.resident_weight_bytes
+           << ",\"minimum_nonresident_bytes\":" << result.minimum_nonresident_bytes
+           << ",\"candidate_h2d_bytes_per_token\":" << result.candidate_h2d_bytes_per_token
+           << ",\"theoretical_h2d_floor_ns\":" << result.theoretical_h2d_floor_ns
+           << ",\"compute_window_margin_ns\":" << result.compute_window_margin_ns
+           << ",\"staging_lead_margin_ns\":" << result.staging_lead_margin_ns
+           << ",\"moe_router_bytes\":" << result.moe_router_bytes
+           << ",\"moe_expert_bytes_per_layer_estimate\":"
+           << result.moe_expert_bytes_per_layer_estimate
+           << ",\"assumed_active_experts_per_layer\":"
+           << result.assumed_active_experts_per_layer << '}';
+    return output.str();
+}
+
+void FormatFeasibility(const ModelIndex& model, const OversizedFeasibilityResult& result) {
+    std::cout << "SIDECAR WU10A STATIC FEASIBILITY\n"
+              << "Model: " << model.model_name << "\n"
+              << "Architecture: " << model.architecture << "\n"
+              << "Status: " << result.status << "\n"
+              << "Evidence: " << result.evidence_class << "\n"
+              << "Persistent weight bytes: " << result.persistent_weight_bytes << "\n"
+              << "Usable VRAM bytes: " << result.usable_vram_bytes << "\n"
+              << "Minimum nonresident bytes: " << result.minimum_nonresident_bytes << "\n"
+              << "Candidate H2D bytes/token: " << result.candidate_h2d_bytes_per_token << "\n"
+              << "Theoretical H2D floor ns: " << result.theoretical_h2d_floor_ns << "\n"
+              << "Compute-window margin ns: " << result.compute_window_margin_ns << "\n"
+              << "Staging-lead margin ns: " << result.staging_lead_margin_ns << "\n";
+    if (result.is_moe) {
+        std::cout << "MoE router bytes: " << result.moe_router_bytes << "\n"
+                  << "MoE estimated expert bytes/layer: "
+                  << result.moe_expert_bytes_per_layer_estimate << "\n"
+                  << "Assumed active experts/layer: "
+                  << result.assumed_active_experts_per_layer << "\n";
+    }
+    std::cout << "No model execution, model load, or authoritative timing was requested.\n";
+}
+
+std::string BaselinePlanToJson(const std::vector<ConventionalBaselinePlanEntry>& plan) {
+    std::ostringstream output;
+    output << '[';
+    for (std::size_t index = 0; index < plan.size(); ++index) {
+        if (index != 0) output << ',';
+        const auto& entry = plan[index];
+        output << "{\"baseline_id\":\"" << JsonEscape(entry.baseline_id)
+               << "\",\"gpu_layers\":" << entry.gpu_layers
+               << ",\"purpose\":\"" << JsonEscape(entry.purpose)
+               << "\",\"bounded_smoke_only\":"
+               << (entry.bounded_smoke_only ? "true" : "false") << '}';
+    }
+    output << ']';
+    return output.str();
+}
+
+int Feasibility(const Options& options) {
+    const auto model = Inspect(options, options.hash);
+    OversizedFeasibilityInputs inputs;
+    inputs.usable_vram_bytes = options.usable_vram_bytes;
+    inputs.h2d_bytes_per_second = options.h2d_bytes_per_second;
+    inputs.compute_window_ns = options.compute_window_ns;
+    inputs.staging_lead_time_ns = options.staging_lead_time_ns;
+    inputs.assumed_active_experts_per_layer = options.assumed_active_experts_per_layer;
+    const auto result = AnalyzeOversizedFeasibility(model, inputs);
+    if (options.json) {
+        std::cout << "{\"model_sha256\":\"" << JsonEscape(model.sha256)
+                  << "\",\"model_storage\":"
+                  << (model.storage ? StorageProvenanceToJson(*model.storage) : "null")
+                  << ",\"feasibility\":" << FeasibilityToJson(result) << "}\n";
+    } else {
+        FormatFeasibility(model, result);
+    }
+    return 0;
+}
+
+int BaselinePlan(const Options& options) {
+    const auto model = Inspect(options, options.hash);
+    const auto plan = BuildConventionalBaselinePlan(model);
+    if (options.json) {
+        std::cout << "{\"model_sha256\":\"" << JsonEscape(model.sha256)
+                  << "\",\"plan\":" << BaselinePlanToJson(plan) << "}\n";
+    } else {
+        std::cout << "SIDECAR WU10A CONVENTIONAL BASELINE PLAN\n";
+        for (const auto& entry : plan) {
+            std::cout << entry.baseline_id << " gpu_layers=" << entry.gpu_layers
+                      << " smoke_only=" << (entry.bounded_smoke_only ? "yes" : "no")
+                      << "\n  " << entry.purpose << '\n';
+        }
+        std::cout << "Run this sequence with identical GGUF bytes, fixture, context, sampling, "
+                     "thread settings, and storage provenance. Keep model-load timing separate "
+                     "from warmed prompt/decode timing.\n";
+    }
+    return 0;
+}
+
+void PersistInference(const Options& options, const ModelIndex& model,
+                      const InferenceConfiguration& configuration,
+                      const InferenceResult& result, std::string_view phase);
+
+int BaselineCampaign(const Options& options) {
+    const auto model = Inspect(options, options.hash);
+    const auto plan = BuildConventionalBaselinePlan(model);
+    if (options.dry_run) {
+        if (options.json) {
+            std::cout << "{\"status\":\"DRY_RUN_NO_INFERENCE\",\"model_sha256\":\""
+                      << JsonEscape(model.sha256) << "\",\"model_storage\":"
+                      << (model.storage ? StorageProvenanceToJson(*model.storage) : "null")
+                      << ",\"plan\":" << BaselinePlanToJson(plan) << "}\n";
+        } else {
+            std::uint64_t persistent_weight_bytes = 0;
+            for (const auto& tensor : model.tensors) {
+                if (tensor.persistent_weight) persistent_weight_bytes += tensor.bytes;
+            }
+            std::cout << "SIDECAR WU10B BASELINE CAMPAIGN DRY RUN\n";
+            std::cout << "Model: " << model.model_name << "\n"
+                      << "Architecture: " << model.architecture << "\n"
+                      << "Persistent weight bytes: " << persistent_weight_bytes << "\n";
+            for (const auto& entry : plan) {
+                std::cout << entry.baseline_id << " gpu_layers=" << entry.gpu_layers
+                          << " smoke_only=" << (entry.bounded_smoke_only ? "yes" : "no")
+                          << '\n';
+            }
+            std::cout << "No inference was executed.\n";
+        }
+        return 0;
+    }
+    if (!options.authoritative) {
+        throw std::invalid_argument(
+            "baseline-campaign execution requires --authoritative; use --dry-run for planning");
+    }
+    if (!options.database) {
+        throw std::invalid_argument(
+            "authoritative baseline-campaign requires --database <path>");
+    }
+    // Resolve the authority gate before allocating a model context.
+    (void)MakeConfiguration(options);
+
+    struct CampaignStep {
+        ConventionalBaselinePlanEntry plan;
+        bool executed{false};
+        std::string skip_reason;
+        InferenceResult result;
+    };
+    std::vector<CampaignStep> steps;
+    std::optional<std::int32_t> maximum_stable_gpu_layers;
+    bool stop_larger_offloads = false;
+    for (const auto& entry : plan) {
+        CampaignStep step;
+        step.plan = entry;
+        if (entry.gpu_layers == -2) {
+            step.skip_reason = "RESOLVED_FROM_EXECUTED_CONTROLS";
+            steps.push_back(std::move(step));
+            continue;
+        }
+        if (stop_larger_offloads && entry.gpu_layers != 0) {
+            step.skip_reason = "SKIPPED_AFTER_LOWER_OFFLOAD_FAILURE";
+            steps.push_back(std::move(step));
+            continue;
+        }
+        auto configuration = MakeConfiguration(options);
+        configuration.gpu_layers = entry.gpu_layers;
+        step.result = RunInference(configuration, &model);
+        step.executed = true;
+        PersistInference(options, model, configuration, step.result,
+                         "WU10B_" + entry.baseline_id);
+        if (step.result.status == "PASS") {
+            if (entry.gpu_layers == -1) {
+                maximum_stable_gpu_layers = -1;
+            } else if (!maximum_stable_gpu_layers ||
+                       (*maximum_stable_gpu_layers != -1 &&
+                        entry.gpu_layers > *maximum_stable_gpu_layers)) {
+                maximum_stable_gpu_layers = entry.gpu_layers;
+            }
+        } else if (entry.gpu_layers > 0) {
+            stop_larger_offloads = true;
+        }
+        steps.push_back(std::move(step));
+    }
+
+    const std::string campaign_status = maximum_stable_gpu_layers
+        ? "COMPLETE_CONVENTIONAL_BASELINE" : "FAILED_NO_STABLE_CONFIGURATION";
+    if (options.json) {
+        std::cout << "{\"status\":\"" << campaign_status
+                  << "\",\"model_sha256\":\"" << JsonEscape(model.sha256)
+                  << "\",\"maximum_stable_gpu_layers\":";
+        if (maximum_stable_gpu_layers) std::cout << *maximum_stable_gpu_layers;
+        else std::cout << "null";
+        std::cout << ",\"steps\":[";
+        for (std::size_t index = 0; index < steps.size(); ++index) {
+            if (index != 0) std::cout << ',';
+            const auto& step = steps[index];
+            std::cout << "{\"baseline_id\":\"" << JsonEscape(step.plan.baseline_id)
+                      << "\",\"gpu_layers\":" << step.plan.gpu_layers
+                      << ",\"executed\":" << (step.executed ? "true" : "false")
+                      << ",\"skip_reason\":\"" << JsonEscape(step.skip_reason) << '"';
+            if (step.executed) {
+                std::cout << ",\"result\":" << InferenceResultToJson(step.result);
+            }
+            std::cout << '}';
+        }
+        std::cout << "]}\n";
+    } else {
+        std::cout << "SIDECAR WU10B CONVENTIONAL BASELINE CAMPAIGN\n"
+                  << "Status: " << campaign_status << '\n'
+                  << "Maximum stable GPU layers: ";
+        if (maximum_stable_gpu_layers) std::cout << *maximum_stable_gpu_layers;
+        else std::cout << "NONE";
+        std::cout << '\n';
+        for (const auto& step : steps) {
+            std::cout << step.plan.baseline_id << " gpu_layers=" << step.plan.gpu_layers
+                      << " status=" << (step.executed ? step.result.status : step.skip_reason)
+                      << '\n';
+        }
+    }
+    return maximum_stable_gpu_layers ? 0 : 4;
+}
+
 void PersistInference(const Options& options, const ModelIndex& model,
                       const InferenceConfiguration& configuration,
                       const InferenceResult& result, std::string_view phase) {
@@ -590,7 +863,9 @@ void PersistInference(const Options& options, const ModelIndex& model,
     session.sidecar_git_commit = CurrentVersionInfo().git_commit;
     session.llama_cpp_git_commit = SIDECAR_LLAMA_CPP_COMMIT;
     session.trace_mode = std::string(ToString(configuration.observer_mode));
-    session.notes = "WU9 real llama.cpp/GGUF observation; hot data accumulated in RAM and persisted after timing";
+    session.notes = std::string(phase).starts_with("WU10B_")
+        ? "WU10B conventional oversized-model baseline; model load is separate from warmed prompt/decode timing"
+        : "WU9 real llama.cpp/GGUF observation; hot data accumulated in RAM and persisted after timing";
     const auto session_id = database.StartBenchmarkSession(session);
 
     try {
@@ -609,15 +884,28 @@ void PersistInference(const Options& options, const ModelIndex& model,
         fixture.description = "Versioned deterministic repeated Sidecar observation fixture; tokenization occurs outside prompt timing";
         database.UpsertInferenceFixture(fixture);
 
+        const std::string effective_load_mode = configuration.sidecar_staging
+            ? "SIDECAR_GGUF_USER_CALLBACK"
+            : result.runtime_configuration_json.find("\"load_mode\":\"none\"") != std::string::npos
+                ? "LLAMA_LOAD_MODE_NONE"
+                : "MMAP_READ_ONLY";
         const std::string canonical = model.sha256 + "\n" + std::string(phase) + "\n" +
             std::string(ToString(configuration.observer_mode)) + "\n" +
             std::to_string(configuration.gpu_layers) + "\n" +
             std::to_string(configuration.context_size) + "\n" +
+            std::to_string(configuration.batch_size) + "\n" +
+            std::to_string(configuration.threads) + "\n" +
+            std::to_string(configuration.batch_threads) + "\n" +
+            (configuration.check_tensors ? "TENSOR_CHECKS_ON\n" : "TENSOR_CHECKS_OFF\n") +
+            (configuration.offload_kqv ? "KQV_ON\n" : "KQV_OFF\n") +
+            (configuration.op_offload ? "OP_ON\n" : "OP_OFF\n") +
             std::to_string(configuration.prompt_tokens) + "\n" +
             std::to_string(configuration.generated_tokens) + "\n" +
             std::to_string(configuration.warmups) + "\n" +
             std::to_string(configuration.repetitions) + "\n" +
-            (configuration.authoritative ? "AUTHORITATIVE" : "NONAUTHORITATIVE");
+            (configuration.authoritative ? "AUTHORITATIVE" : "NONAUTHORITATIVE") +
+            std::string("\n") + (configuration.sidecar_staging ? "SIDECAR_STAGING" : "NATIVE_LOADER") +
+            "\n" + effective_load_mode;
         database::InferenceConfigurationRecordInput config_record;
         config_record.session_id = session_id;
         config_record.model_id = model.sha256;
@@ -632,8 +920,11 @@ void PersistInference(const Options& options, const ModelIndex& model,
         config_record.warmups = configuration.warmups;
         config_record.repetitions = configuration.repetitions;
         config_record.seed = configuration.seed;
-        config_record.backend_mode = configuration.gpu_layers < 0 ? "CUDA_FULL_OFFLOAD_REQUESTED" : "LLAMA_NATIVE_PARTIAL_OFFLOAD_CONTROL";
-        config_record.load_mode = "MMAP_READ_ONLY";
+        config_record.backend_mode = configuration.sidecar_staging ? "SIDECAR_USER_CALLBACK_STAGING" :
+            configuration.gpu_layers == 0 ? "CPU_ONLY_CONTROL" :
+            configuration.gpu_layers < 0 ? "CUDA_FULL_OFFLOAD_REQUESTED" :
+                                           "LLAMA_NATIVE_PARTIAL_OFFLOAD_CONTROL";
+        config_record.load_mode = effective_load_mode;
         config_record.status = result.status;
         const auto configuration_id = database.InsertInferenceConfiguration(config_record);
 
@@ -877,13 +1168,19 @@ void PrintLlamaUsage() {
         << "  sidecar-lab llama info [--json]\n"
         << "  sidecar-lab llama model inspect <path> [--json] [--tensors] [provenance] [--database path]\n"
         << "  sidecar-lab llama model verify <path> [--json] [provenance] [--database path]\n"
-        << "  sidecar-lab llama baseline --model path [--prompt-tokens N] [--generate-tokens N] [--json]\n"
-        << "  sidecar-lab llama observe --model path --observer MODE [--trace path] [--json]\n"
+        << "  sidecar-lab llama baseline --model path [--prompt-tokens N] [--generate-tokens N] [--batch-size N] [--threads N] [--batch-threads N] [--no-tensor-checks] [--no-kqv-offload] [--no-op-offload] [--json]\n"
+        << "  sidecar-lab llama sidecar --model path --sidecar-stage [--tiny-fast] [--gpu-layers N] [--batch-size N] [--threads N] [--batch-threads N] [--no-tensor-checks] [--no-kqv-offload] [--no-op-offload] [--json]\n"
+        << "  sidecar-lab llama observe --model path --observer MODE [--tiny-fast] [--prompt-tokens N] [--generate-tokens N] [--context N] [--batch-size N] [--threads N] [--batch-threads N] [--gpu-layers N] [--no-tensor-checks] [--trace path] [--json]\n"
         << "  sidecar-lab llama overhead --model path --observer MODE [--repetitions N] [--json]\n"
         << "  sidecar-lab llama demand --model path [--json]\n"
+        << "  sidecar-lab llama feasibility --model path --usable-vram-bytes N --h2d-bytes-per-second N [--compute-window-ns N] [--staging-lead-ns N] [--active-experts-per-layer N] [--json]\n"
+        << "  sidecar-lab llama baseline-plan --model path [--json]\n"
+        << "  sidecar-lab llama baseline-campaign --model path --dry-run [--json]\n"
+        << "  sidecar-lab llama baseline-campaign --model path --authoritative --database path [configuration] [--json]\n"
         << "  sidecar-lab llama shadow --causal-lead-ns N --oracle-lead-ns N --pipeline-ns N [--json]\n"
         << "  sidecar-lab llama report --database path [--json]\n"
-        << "  sidecar-lab llama validate --model path [--json]\n";
+        << "  sidecar-lab llama validate --model path [--json]\n"
+        << "  Native models <=18 GiB use load_mode=none by default; set SIDECAR_LLAMA_LOAD_MODE=auto for the mmap control.\n";
 }
 
 int Info(const Options& options) {
@@ -918,6 +1215,7 @@ int ModelCommand(std::string_view action, const Options& options) {
         configuration.context_size = 512;
         configuration.warmups = 0;
         configuration.repetitions = 1;
+        configuration.check_tensors = true;
         const auto validation = RunInference(configuration, &model);
         if (validation.status == "PASS") {
             model.verification_status = "PINNED_LLAMA_LOAD_AND_DECODE_PASS";
@@ -938,6 +1236,75 @@ int ModelCommand(std::string_view action, const Options& options) {
 
 int InferenceCommand(std::string_view action, Options options) {
     if (action == "baseline") options.observer = ObserverMode::None;
+    if (action == "sidecar" || action == "observe") {
+        if (action == "sidecar") {
+            options.observer = ObserverMode::None;
+            options.sidecar_staging = true;
+        }
+        constexpr auto kFullOffloadFileSizeCeiling =
+            std::uintmax_t{18} * 1024U * 1024U * 1024U;
+        if (options.tiny_fast) {
+            const auto requested_tokens = static_cast<std::uint64_t>(options.prompt) + options.generate;
+            if (requested_tokens > 32U)
+                throw std::invalid_argument("--tiny-fast requires prompt+generate <= 32 tokens");
+            if (options.gpu_layers_specified && options.gpu_layers != 30 && options.gpu_layers != 31)
+                throw std::invalid_argument("--tiny-fast requires --gpu-layers 30, 31, or an omitted GPU-layer setting");
+            std::error_code file_size_error;
+            const auto model_size = std::filesystem::file_size(options.model, file_size_error);
+            options.gpu_layers = !options.gpu_layers_specified && !file_size_error &&
+                                 model_size <= kFullOffloadFileSizeCeiling ? -1 :
+                                 (options.gpu_layers_specified ? options.gpu_layers : 30);
+            // Tiny single-token decode requests benefit from the smaller
+            // ubatch: on the bounded 30-layer Mixtral profile, batch 8
+            // improves decode throughput while preserving prompt capacity.
+            if (options.batch_size == 0) options.batch_size = 8;
+        } else if (!options.gpu_layers_specified) {
+            // An omitted layer count previously requested all layers. That is
+            // correct for smaller models that fit comfortably, but on the
+            // 24 GiB development GPU it overcommits the 26 GiB Mixtral model
+            // and collapses tiny-request throughput. Use a conservative
+            // size-based default while keeping explicit requests authoritative.
+            std::error_code file_size_error;
+            const auto model_size = std::filesystem::file_size(options.model, file_size_error);
+            options.gpu_layers = !file_size_error && model_size <= kFullOffloadFileSizeCeiling
+                ? -1 : 29;
+        }
+        if (!options.context_specified) {
+            const auto requested_tokens = static_cast<std::uint64_t>(options.prompt) + options.generate;
+            // Avoid allocating an oversized KV cache for short interactive
+            // requests.  Explicit --context remains authoritative; requests
+            // larger than the historical default retain the old validation.
+            if (requested_tokens <= 4096U) {
+                std::uint32_t adaptive_context = 256U;
+                while (adaptive_context < requested_tokens && adaptive_context < 4096U)
+                    adaptive_context *= 2U;
+                options.context = adaptive_context;
+            }
+        }
+        if (options.threads == 0) {
+            const auto logical_processors = std::thread::hardware_concurrency();
+            if (logical_processors != 0) {
+                const auto capped_processors = (std::min)(logical_processors, 32U);
+                // On the development machine, leaving four workers out of the
+                // single-token pool while retaining the full batch pool gives
+                // a repeatable decode improvement on the hybrid CPU.  Keep
+                // explicit --threads/--batch-threads authoritative.
+                options.threads = capped_processors >= 24U
+                    ? capped_processors - 4U : capped_processors;
+                if (options.batch_threads == 0)
+                    options.batch_threads = capped_processors;
+            }
+        }
+        if (options.batch_size == 0) {
+            // Keep enough batch capacity to amortize the per-graph launch cost
+            // for medium prompts.  The cap preserves the existing memory
+            // ceiling, while the minimum keeps tiny smoke prompts efficient.
+            const auto prompt_floor = (std::max)(options.prompt, 16U);
+            options.batch_size = prompt_floor <= 16U
+                ? 16U
+                : (prompt_floor >= 256U ? 512U : prompt_floor * 2U);
+        }
+    }
     if (action == "demand") options.observer = ObserverMode::LightNode;
     if (action == "validate") {
         options.prompt = 8; options.generate = 2; options.context = 512;
@@ -1187,8 +1554,11 @@ int RunLlamaCli(int argc, char** argv) {
         if (action != "inspect" && action != "verify") throw std::invalid_argument("unknown llama model action");
         return ModelCommand(action, ParseOptions(argc, argv, 4));
     }
-    if (command == "baseline" || command == "observe" || command == "demand" || command == "validate")
+    if (command == "baseline" || command == "sidecar" || command == "observe" || command == "demand" || command == "validate")
         return InferenceCommand(command, ParseOptions(argc, argv, 3));
+    if (command == "feasibility") return Feasibility(ParseOptions(argc, argv, 3));
+    if (command == "baseline-plan") return BaselinePlan(ParseOptions(argc, argv, 3));
+    if (command == "baseline-campaign") return BaselineCampaign(ParseOptions(argc, argv, 3));
     if (command == "overhead") return Overhead(ParseOptions(argc, argv, 3));
     if (command == "shadow") return Shadow(ParseOptions(argc, argv, 3));
     if (command == "report") return Report(ParseOptions(argc, argv, 3));

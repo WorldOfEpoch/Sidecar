@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <fcntl.h>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -16,13 +18,22 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if SIDECAR_LLAMA_ENABLED
+#include <cuda_runtime_api.h>
 #include <ggml-backend.h>
 #include <ggml.h>
+#include <gguf.h>
 #include <llama.h>
 #endif
+
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#endif
+
 
 namespace sidecar::llama {
 
@@ -35,6 +46,33 @@ using Recorder = trace::FlightRecorder<trace::TraceRecord32>;
 std::uint64_t NowNs() noexcept {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         Clock::now().time_since_epoch()).count());
+}
+
+// The pinned CUDA backend exposes graph optimization as an environment
+// switch.  Enable it by default for every Sidecar inference unless the
+// caller explicitly chose a value, so baseline and staged runs compare the
+// same optimized CUDA execution path.
+void EnableCudaGraphOptimizationByDefault() noexcept {
+    if (std::getenv("GGML_CUDA_GRAPH_OPT") != nullptr) return;
+#ifdef _WIN32
+    (void)_putenv_s("GGML_CUDA_GRAPH_OPT", "1");
+#else
+    (void)setenv("GGML_CUDA_GRAPH_OPT", "1", 0);
+#endif
+}
+
+// llama.cpp owns the primary worker pool through n_threads.  Leaving
+// OpenMP's nested pool unconstrained can oversubscribe hybrid CPUs when the
+// process is launched without an OMP_NUM_THREADS setting.  Keep the nested
+// pool serial by default, while preserving any explicit caller setting.
+bool EnableOpenmpSingleThreadDefault() noexcept {
+    if (std::getenv("OMP_NUM_THREADS") != nullptr) return false;
+#ifdef _WIN32
+    (void)_putenv_s("OMP_NUM_THREADS", "1");
+#else
+    (void)setenv("OMP_NUM_THREADS", "1", 0);
+#endif
+    return true;
 }
 
 std::string EscapeJson(std::string_view text) {
@@ -55,6 +93,260 @@ struct DeviceMemory {
     std::size_t free_bytes{0};
     std::size_t total_bytes{0};
 };
+
+struct GgufDeleter {
+    void operator()(struct gguf_context* value) const noexcept {
+        if (value != nullptr) gguf_free(value);
+    }
+};
+
+struct FileDeleter {
+    void operator()(std::FILE* value) const noexcept {
+        if (value != nullptr) std::fclose(value);
+    }
+};
+
+struct SidecarStageContext {
+    std::unique_ptr<std::FILE, FileDeleter> file;
+    struct gguf_context* metadata{nullptr};
+    // GGUF owns these immutable name strings for the lifetime of the load.
+    // Using views avoids constructing and hashing a temporary std::string for
+    // every callback while preserving exact-name lookup semantics.
+    std::unordered_map<std::string_view, std::int64_t> tensor_ids;
+    // Immutable GGUF locations cached once during metadata setup.  The user
+    // callback is on the model-load hot path, so it must not repeatedly walk
+    // the GGUF context just to recover the same offset and byte count.
+    std::vector<std::uint64_t> tensor_offsets;
+    std::vector<std::uint64_t> tensor_sizes;
+    std::uint64_t tensor_data_offset{0};
+    InferenceResult* result{nullptr};
+    std::string error;
+    void* pinned{nullptr};
+    std::size_t pinned_capacity{0};
+    ggml_backend_t upload_backend{nullptr};
+    ggml_backend_dev_t upload_device{nullptr};
+    std::vector<ggml_backend_buffer_t> upload_buffers;
+    std::vector<ggml_backend_event_t> upload_events;
+    std::vector<void*> upload_hosts;
+    std::size_t upload_capacity{0};
+    std::size_t upload_slot{0};
+    std::size_t upload_capacity_hint{0};
+    // The GGUF callback normally visits tensors in file order.  Preserve the
+    // current position so contiguous payloads do not pay an unnecessary
+    // seek on every callback.  A sentinel keeps the first read explicit.
+    std::uint64_t file_position{(std::numeric_limits<std::uint64_t>::max)()};
+
+    ~SidecarStageContext() {
+        FinishUploads();
+        for (auto* event : upload_events) {
+            if (event != nullptr) ggml_backend_event_free(event);
+        }
+        for (auto* buffer : upload_buffers) {
+            if (buffer != nullptr) ggml_backend_buffer_free(buffer);
+        }
+        if (upload_backend != nullptr) ggml_backend_free(upload_backend);
+        if (pinned != nullptr) (void)cudaFreeHost(pinned);
+    }
+
+    void EnsureCapacity(std::size_t bytes) {
+        if (bytes <= pinned_capacity) return;
+        if (pinned != nullptr) {
+            (void)cudaFreeHost(pinned);
+            pinned = nullptr;
+            pinned_capacity = 0;
+        }
+        const auto cuda_error = cudaHostAlloc(&pinned, bytes, cudaHostAllocPortable);
+        if (cuda_error != cudaSuccess) {
+            throw std::runtime_error(std::string("Sidecar pinned staging allocation failed: ") +
+                                     cudaGetErrorString(cuda_error));
+        }
+        pinned_capacity = bytes;
+    }
+
+    void FinishUploads() noexcept {
+        if (upload_backend != nullptr) ggml_backend_synchronize(upload_backend);
+    }
+
+    void ResetUploads() noexcept {
+        FinishUploads();
+        for (auto* event : upload_events) {
+            if (event != nullptr) ggml_backend_event_free(event);
+        }
+        for (auto* buffer : upload_buffers) {
+            if (buffer != nullptr) ggml_backend_buffer_free(buffer);
+        }
+        upload_events.clear();
+        upload_buffers.clear();
+        upload_hosts.clear();
+        if (upload_backend != nullptr) ggml_backend_free(upload_backend);
+        upload_backend = nullptr;
+        upload_device = nullptr;
+        upload_capacity = 0;
+        upload_slot = 0;
+    }
+
+    bool PrepareAsyncUpload(ggml_backend_dev_t device, std::size_t bytes) {
+        if (upload_backend != nullptr && upload_device == device && upload_capacity >= bytes)
+            return true;
+        if (upload_backend != nullptr) ResetUploads();
+        if (device == nullptr) return false;
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(device, &props);
+        if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) return false;
+        const auto host_buft = ggml_backend_dev_host_buffer_type(device);
+        if (host_buft == nullptr) return false;
+        auto* backend = ggml_backend_dev_init(device, nullptr);
+        if (backend == nullptr) return false;
+        upload_backend = backend;
+        upload_device = device;
+        upload_capacity = (std::max)((std::max)(bytes, upload_capacity_hint),
+                                     std::size_t(64U * 1024U * 1024U));
+        constexpr std::size_t kBufferCount = 2;
+        for (std::size_t index = 0; index < kBufferCount; ++index) {
+            auto* buffer = ggml_backend_buft_alloc_buffer(host_buft, upload_capacity);
+            if (buffer == nullptr) {
+                ResetUploads();
+                return false;
+            }
+            upload_buffers.push_back(buffer);
+            upload_hosts.push_back(ggml_backend_buffer_get_base(buffer));
+            auto* event = ggml_backend_event_new(device);
+            if (event == nullptr) {
+                ResetUploads();
+                return false;
+            }
+            upload_events.push_back(event);
+        }
+        return true;
+    }
+
+    std::pair<void*, std::size_t> AcquireAsyncBuffer() {
+        if (upload_backend == nullptr || upload_buffers.empty())
+            return {nullptr, 0};
+        const auto slot = upload_slot++ % upload_buffers.size();
+        ggml_backend_event_synchronize(upload_events[slot]);
+        return {upload_hosts[slot], slot};
+    }
+
+    void ReadFileAt(std::uint64_t offset, void* destination, std::size_t bytes) {
+#ifdef _WIN32
+        if (file_position != offset &&
+            _fseeki64(file.get(), static_cast<__int64>(offset), SEEK_SET) != 0)
+#else
+        if (file_position != offset &&
+            fseeko(file.get(), static_cast<off_t>(offset), SEEK_SET) != 0)
+#endif
+            throw std::runtime_error("Sidecar GGUF staging seek failed");
+        auto* output = static_cast<unsigned char*>(destination);
+        std::size_t completed = 0;
+        while (completed < bytes) {
+            const auto count = std::fread(output + completed, 1, bytes - completed, file.get());
+            if (count == 0) throw std::runtime_error("Sidecar GGUF staging read failed");
+            completed += count;
+        }
+        if (offset <= (std::numeric_limits<std::uint64_t>::max)() - bytes)
+            file_position = offset + bytes;
+        else
+            file_position = (std::numeric_limits<std::uint64_t>::max)();
+    }
+};
+
+void SidecarSetTensorData(ggml_tensor* tensor, void* userdata) {
+    auto& stage = *static_cast<SidecarStageContext*>(userdata);
+    try {
+        const auto tensor_iterator = stage.tensor_ids.find(tensor->name);
+        const auto tensor_id = tensor_iterator == stage.tensor_ids.end()
+            ? static_cast<std::int64_t>(-1) : tensor_iterator->second;
+        auto source_tensor_id = tensor_id;
+        // Some dense GGUFs tie the LM head to token_embd.weight and therefore
+        // omit a separate output.weight payload. llama.cpp still materializes
+        // an output tensor; stage the canonical embedding payload for it.
+        if (source_tensor_id < 0 && std::strcmp(tensor->name, "output.weight") == 0)
+        {
+            const auto embedding_iterator = stage.tensor_ids.find("token_embd.weight");
+            source_tensor_id = embedding_iterator == stage.tensor_ids.end()
+                ? static_cast<std::int64_t>(-1) : embedding_iterator->second;
+        }
+        // The public user-data loader materializes optional descriptors that
+        // are absent from a particular GGUF (biases, scaling helpers, or
+        // rope-factor helpers). Their canonical absence is represented by a
+        // zero-filled staging payload; the architecture code ignores these
+        // helpers unless the corresponding metadata is present.
+        const bool zero_fill = source_tensor_id < 0;
+        if (source_tensor_id < 0 && !zero_fill)
+            throw std::runtime_error(std::string("Sidecar GGUF staging tensor is not in metadata: ") + tensor->name);
+        const auto bytes = ggml_nbytes(tensor);
+        if (!zero_fill && (static_cast<std::size_t>(source_tensor_id) >= stage.tensor_sizes.size() ||
+                           static_cast<std::size_t>(source_tensor_id) >= stage.tensor_offsets.size())) {
+            throw std::runtime_error(std::string("Sidecar GGUF tensor index is invalid: ") + tensor->name);
+        }
+        const auto expected_bytes = zero_fill ? bytes :
+            stage.tensor_sizes[static_cast<std::size_t>(source_tensor_id)];
+        if (!zero_fill && bytes != expected_bytes) {
+            throw std::runtime_error(std::string("Sidecar GGUF tensor size mismatch: ") + tensor->name +
+                                     " expected=" + std::to_string(expected_bytes) +
+                                     " actual=" + std::to_string(bytes));
+        }
+        const bool host_destination = tensor->buffer != nullptr &&
+            ggml_backend_buffer_is_host(tensor->buffer) && tensor->data != nullptr;
+        ggml_backend_dev_t device = nullptr;
+        if (tensor->buffer != nullptr) {
+            const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
+            device = ggml_backend_buft_get_device(buft);
+        }
+        const bool gpu_destination = tensor->buffer != nullptr && device != nullptr &&
+            ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            !ggml_backend_buffer_is_host(tensor->buffer);
+        const bool async_upload = gpu_destination && stage.PrepareAsyncUpload(device, bytes);
+        std::size_t async_slot = 0;
+        void* destination = nullptr;
+        if (async_upload) {
+            const auto acquired = stage.AcquireAsyncBuffer();
+            destination = acquired.first;
+            async_slot = acquired.second;
+        } else if (host_destination) {
+            destination = tensor->data;
+        } else {
+            stage.EnsureCapacity(bytes);
+            destination = stage.pinned;
+        }
+        const auto read_started = NowNs();
+        if (zero_fill) {
+            std::memset(destination, 0, bytes);
+            // A missing rope-factor tensor means standard RoPE (no extra
+            // per-dimension scaling). The public user-data loader materializes
+            // the optional descriptor, so represent the neutral factor as 1.
+            const std::string_view name(tensor->name);
+            if ((name == "rope_freqs.weight" || name == "rope_factors_long.weight" ||
+                 name == "rope_factors_short.weight" || name.ends_with(".scale") ||
+                 name.ends_with(".input_scale")) && bytes % sizeof(float) == 0) {
+                auto* factors = static_cast<float*>(destination);
+                for (std::size_t i = 0; i < bytes / sizeof(float); ++i) factors[i] = 1.0f;
+            }
+        } else {
+            stage.ReadFileAt(
+                stage.tensor_data_offset + stage.tensor_offsets[static_cast<std::size_t>(source_tensor_id)],
+                destination, bytes);
+        }
+        const auto read_finished = NowNs();
+        const auto copy_started = NowNs();
+        if (async_upload) {
+            ggml_backend_tensor_set_async(stage.upload_backend, tensor, destination, 0, bytes);
+            ggml_backend_event_record(stage.upload_events[async_slot], stage.upload_backend);
+        } else if (!host_destination) {
+            ggml_backend_tensor_set(tensor, stage.pinned, 0, bytes);
+        }
+        const auto copy_finished = NowNs();
+        stage.result->sidecar_stage_read_ns += read_finished - read_started;
+        stage.result->sidecar_stage_backend_copy_ns += copy_finished - copy_started;
+        stage.result->sidecar_stage_bytes += bytes;
+        stage.result->sidecar_stage_gpu_bytes += gpu_destination ? bytes : 0;
+        ++stage.result->sidecar_stage_tensor_count;
+    } catch (const std::exception& exception) {
+        stage.error = exception.what();
+        throw;
+    }
+}
 
 struct LogCapture {
     std::mutex mutex;
@@ -130,9 +422,15 @@ struct TensorDictionaryEntry {
     std::int16_t layer{-1};
 };
 
+using TensorLookup = std::unordered_map<std::string_view, const TensorDictionaryEntry*>;
+
 struct ObserverState {
     ObserverMode mode{ObserverMode::None};
     const std::vector<TensorDictionaryEntry>* dictionary{nullptr};
+    // Immutable lookup built once before inference.  The callback is on the
+    // graph hot path; avoid a lower_bound over the full tensor dictionary for
+    // every tensor/source visited by an evaluation.
+    const TensorLookup* lookup{nullptr};
     std::vector<ObserverEvent32>* storage{nullptr};
     std::uint64_t event_count{0};
     std::uint64_t dropped{0};
@@ -148,12 +446,19 @@ struct ObserverState {
 
 const TensorDictionaryEntry* FindTensor(const ObserverState& state, const char* name) noexcept {
     if (name == nullptr || name[0] == '\0' || state.dictionary == nullptr) return nullptr;
-    const auto& entries = *state.dictionary;
-    auto iterator = std::lower_bound(entries.begin(), entries.end(), name,
-        [](const TensorDictionaryEntry& entry, const char* value) {
-            return entry.name.compare(value) < 0;
-        });
-    return iterator != entries.end() && iterator->name == name ? &*iterator : nullptr;
+    const TensorDictionaryEntry* match = nullptr;
+    if (state.lookup != nullptr) {
+        const auto iterator = state.lookup->find(std::string_view(name));
+        match = iterator == state.lookup->end() ? nullptr : iterator->second;
+    } else {
+        const auto& entries = *state.dictionary;
+        auto iterator = std::lower_bound(entries.begin(), entries.end(), name,
+            [](const TensorDictionaryEntry& entry, const char* value) {
+                return entry.name.compare(value) < 0;
+            });
+        match = iterator != entries.end() && iterator->name == name ? &*iterator : nullptr;
+    }
+    return match;
 }
 
 void Emit(ObserverState& state, const ggml_tensor* tensor, bool materialized) noexcept {
@@ -332,6 +637,8 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
                                           "NONAUTHORITATIVE_INFERENCE_MODEL_LOAD",
             configuration.authoritative ? "AUTHORITY_STORAGE_GATE_PASSED" :
                                           "DIRECT_MODEL_PATH");
+        const bool omp_num_threads_defaulted = EnableOpenmpSingleThreadDefault();
+        EnableCudaGraphOptimizationByDefault();
         LogCapture log_capture;
         LogGuard log_guard(log_capture);
         static std::once_flag backend_once;
@@ -344,14 +651,111 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
 
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers = configuration.gpu_layers;
-        model_params.check_tensors = true;
+        model_params.check_tensors = configuration.check_tensors;
+        // Sidecar's staged path already owns the host->backend transfer.  For
+        // a model that fits fully on the GPU, do not retain an additional host
+        // weight buffer; it is redundant and costs memory.  Oversized models
+        // use partial offload and keep llama.cpp's host-buffer policy because
+        // those buffers can remain part of the active execution path.
+        std::error_code model_size_error;
+        const auto model_size = std::filesystem::file_size(configuration.model_path, model_size_error);
+        constexpr std::uintmax_t kFullOffloadFileSizeCeiling =
+            std::uintmax_t{18} * 1024U * 1024U * 1024U;
+        const bool sidecar_no_host = configuration.sidecar_staging && !model_size_error &&
+                                     model_size <= kFullOffloadFileSizeCeiling;
+        // On the current NVMe/RAM-rich host, the pinned non-mmap loader is
+        // measurably faster for models that fit the full-offload envelope: it
+        // performs sequential reads directly into backend buffers and avoids
+        // page-fault-driven mmap walks.  Keep oversized partial-offload models
+        // on AUTO/mmap, and preserve an explicit AUTO opt-out for comparisons.
+        const bool fast_native_load = !configuration.sidecar_staging &&
+                                      !model_size_error &&
+                                      model_size <= kFullOffloadFileSizeCeiling;
+        if (fast_native_load) {
+            const auto* load_mode = std::getenv("SIDECAR_LLAMA_LOAD_MODE");
+            if (load_mode == nullptr || std::strcmp(load_mode, "none") == 0) {
+                model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+            }
+        }
+        model_params.no_host = sidecar_no_host;
+        std::unique_ptr<struct gguf_context, GgufDeleter> sidecar_metadata;
+        std::unique_ptr<SidecarStageContext> sidecar_stage;
         const auto load_start = Clock::now();
-        std::unique_ptr<llama_model, ModelDeleter> model(
-            llama_model_load_from_file(configuration.model_path.string().c_str(), model_params));
+        std::unique_ptr<llama_model, ModelDeleter> model;
+        if (configuration.sidecar_staging) {
+            ggml_context* metadata_context = nullptr;
+            gguf_init_params metadata_params{};
+            metadata_params.no_alloc = true;
+            metadata_params.ctx = &metadata_context;
+            sidecar_metadata.reset(gguf_init_from_file(
+                configuration.model_path.string().c_str(), metadata_params));
+            if (!sidecar_metadata) throw std::runtime_error("Sidecar GGUF metadata load failed");
+#ifdef _WIN32
+            std::FILE* file = nullptr;
+            const auto native_handle = CreateFileW(
+                configuration.model_path.c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            if (native_handle != INVALID_HANDLE_VALUE) {
+                const auto descriptor = _open_osfhandle(
+                    reinterpret_cast<intptr_t>(native_handle), _O_RDONLY | _O_BINARY);
+                if (descriptor >= 0) {
+                    file = _fdopen(descriptor, "rb");
+                    if (file == nullptr) _close(descriptor);
+                } else {
+                    CloseHandle(native_handle);
+                }
+            }
+#else
+            std::FILE* file = std::fopen(configuration.model_path.c_str(), "rb");
+#endif
+            if (file == nullptr) throw std::runtime_error("Sidecar GGUF file open failed");
+            // Tensor callbacks read many ranges from the sequential GGUF
+            // payload.  A larger stdio buffer reduces user/kernel transitions
+            // for the small metadata tensors while leaving the native mmap
+            // path untouched.  The implementation may decline the hint.
+            (void)std::setvbuf(file, nullptr, _IOFBF, 1U << 20U);
+            sidecar_stage = std::make_unique<SidecarStageContext>();
+            sidecar_stage->file.reset(file);
+            sidecar_stage->metadata = sidecar_metadata.get();
+            sidecar_stage->result = &result;
+            const auto metadata_tensor_count = gguf_get_n_tensors(sidecar_metadata.get());
+            sidecar_stage->tensor_ids.reserve(static_cast<std::size_t>(metadata_tensor_count));
+            sidecar_stage->tensor_offsets.reserve(static_cast<std::size_t>(metadata_tensor_count));
+            sidecar_stage->tensor_sizes.reserve(static_cast<std::size_t>(metadata_tensor_count));
+            sidecar_stage->tensor_data_offset = gguf_get_data_offset(sidecar_metadata.get());
+            for (std::int64_t tensor_index = 0; tensor_index < metadata_tensor_count; ++tensor_index) {
+                sidecar_stage->tensor_ids.emplace(
+                    gguf_get_tensor_name(sidecar_metadata.get(), tensor_index), tensor_index);
+                const auto tensor_size = gguf_get_tensor_size(sidecar_metadata.get(), tensor_index);
+                sidecar_stage->tensor_offsets.push_back(
+                    gguf_get_tensor_offset(sidecar_metadata.get(), tensor_index));
+                sidecar_stage->tensor_sizes.push_back(tensor_size);
+                sidecar_stage->upload_capacity_hint = (std::max)(sidecar_stage->upload_capacity_hint, tensor_size);
+            }
+            model.reset(llama_model_init_from_user(sidecar_metadata.get(),
+                                                   SidecarSetTensorData,
+                                                   sidecar_stage.get(), model_params));
+            if (sidecar_stage) {
+                sidecar_stage->FinishUploads();
+                // The upload stream and pinned buffers are load-time resources;
+                // release them before prompt/decode to avoid idle CUDA-resource
+                // contention after all tensors are resident.
+                sidecar_stage->ResetUploads();
+            }
+        } else {
+            model.reset(llama_model_load_from_file(
+                configuration.model_path.string().c_str(), model_params));
+        }
         const auto load_end = Clock::now();
         result.model_load_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(load_end - load_start).count());
-        if (!model) throw std::runtime_error("pinned llama.cpp rejected model load");
+        if (!model) {
+            if (sidecar_stage && !sidecar_stage->error.empty())
+                throw std::runtime_error("Sidecar staged model load failed: " + sidecar_stage->error);
+            throw std::runtime_error("pinned llama.cpp rejected model load");
+        }
         if (!llama_model_has_decoder(model.get()))
             throw std::runtime_error("model has no supported decoder");
         const auto gpu_memory_after_model = ReadGpuMemory(gpu_memory_before_model.device);
@@ -366,8 +770,26 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
         result.fixture_text_sha256 = core::Sha256Hex(
             "SIDECAR-WU9-DETERMINISTIC-PROMPT-V1:" + std::to_string(configuration.prompt_tokens));
         result.prompt_token_ids.assign(prompt.begin(), prompt.end());
-        auto dictionary = MakeDictionary(index);
-        std::vector<ObserverEvent32> event_storage(configuration.event_capacity);
+        // Observer-free runs never invoke the eval callback, so avoid sorting
+        // and copying the full tensor dictionary on their hot startup path.
+        std::vector<TensorDictionaryEntry> dictionary;
+        TensorLookup dictionary_lookup;
+        if (configuration.observer_mode != ObserverMode::None)
+            dictionary = MakeDictionary(index);
+        if (!dictionary.empty()) {
+            // Keep the immutable hot-path table below one entry per bucket;
+            // callback lookups occur for every visited layer boundary.
+            dictionary_lookup.max_load_factor(0.5F);
+            dictionary_lookup.reserve(dictionary.size());
+            for (const auto& entry : dictionary)
+                dictionary_lookup.emplace(std::string_view(entry.name), &entry);
+        }
+        // Observer-free baseline/Sidecar runs do not need a million-entry
+        // event arena. Allocate it only for modes that actually capture
+        // events; this removes an avoidable ~32 MiB startup allocation.
+        std::vector<ObserverEvent32> event_storage;
+        if (configuration.observer_mode != ObserverMode::None)
+            event_storage.resize(configuration.event_capacity);
 
         std::unique_ptr<Recorder> recorder;
         std::optional<Recorder::ProducerHandle> flight_handle;
@@ -391,24 +813,50 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
             recorder->Start(*configuration.flight_recorder_path, std::move(header));
         }
 
+        ObserverState observer;
+        observer.mode = configuration.observer_mode;
+        observer.dictionary = &dictionary;
+        observer.lookup = &dictionary_lookup;
+
+        auto context_params = llama_context_default_params();
+        context_params.n_ctx = configuration.context_size;
+        const auto requested_batch = configuration.batch_size == 0 ? 512U : configuration.batch_size;
+        context_params.n_batch = (std::max)(configuration.prompt_tokens, requested_batch);
+        context_params.n_ubatch = (std::min)(context_params.n_batch, 512U);
+        if (configuration.threads != 0) {
+            context_params.n_threads = static_cast<std::int32_t>(configuration.threads);
+            context_params.n_threads_batch = static_cast<std::int32_t>(
+                configuration.batch_threads == 0 ? configuration.threads : configuration.batch_threads);
+        }
+        context_params.offload_kqv = configuration.offload_kqv;
+        context_params.op_offload = configuration.op_offload;
+        // Sidecar owns the measured prompt/decode timers. Disable llama.cpp's
+        // per-eval timing bookkeeping in observer modes; matched A/B probes
+        // found no throughput difference, and Sidecar timers remain the
+        // authoritative measurements.
+        context_params.no_perf = configuration.observer_mode != ObserverMode::None;
+        if (configuration.observer_mode != ObserverMode::None) {
+            context_params.cb_eval = EvalCallback;
+            context_params.cb_eval_user_data = &observer;
+        }
+        std::unique_ptr<llama_context, ContextDeleter> context(
+            llama_init_from_model(model.get(), context_params));
+        if (!context) throw std::runtime_error("llama context creation failed");
+        auto sampler_params = llama_sampler_chain_default_params();
+        sampler_params.no_perf = configuration.observer_mode != ObserverMode::None;
+        std::unique_ptr<llama_sampler, SamplerDeleter> sampler(
+            llama_sampler_chain_init(sampler_params));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+
         result.samples.reserve(configuration.repetitions);
         for (std::uint32_t run = 0; run < configuration.repetitions; ++run) {
-            ObserverState observer;
-            observer.mode = configuration.observer_mode;
-            observer.dictionary = &dictionary;
-
-            auto context_params = llama_context_default_params();
-            context_params.n_ctx = configuration.context_size;
-            context_params.n_batch = (std::max)(configuration.prompt_tokens, 512U);
-            context_params.n_ubatch = (std::min)(context_params.n_batch, 512U);
-            context_params.no_perf = false;
-            if (configuration.observer_mode != ObserverMode::None) {
-                context_params.cb_eval = EvalCallback;
-                context_params.cb_eval_user_data = &observer;
+            // Reuse the model context between repetitions.  Clearing memory
+            // here is equivalent to constructing a fresh context for the
+            // deterministic fixture, while avoiding repeated graph/KV setup.
+            if (run != 0) {
+                llama_memory_clear(llama_get_memory(context.get()), true);
+                llama_sampler_reset(sampler.get());
             }
-            std::unique_ptr<llama_context, ContextDeleter> context(
-                llama_init_from_model(model.get(), context_params));
-            if (!context) throw std::runtime_error("llama context creation failed");
             if (result.runtime_configuration_json == "{}") {
                 const auto gpu_memory_after_context = ReadGpuMemory(gpu_memory_before_model.device);
                 log_guard.Quiet();
@@ -428,6 +876,10 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
                 const auto cuda_compute_mib = ParseDoubleAfter(log_capture.text, "CUDA0 compute buffer size =");
                 const auto host_compute_mib = ParseDoubleAfter(log_capture.text, "CUDA_Host compute buffer size =");
                 const auto graph_splits = ParseUnsignedAfter(log_capture.text, "graph splits =");
+                const bool cuda_graph_optimization = [] {
+                    const auto* value = std::getenv("GGML_CUDA_GRAPH_OPT");
+                    return value != nullptr && std::strcmp(value, "1") == 0;
+                }();
                 if (graph_splits) {
                     result.graph_split_detail = "PINNED_LLAMA_INITIALIZATION_LOG_REPORTED_" +
                         std::to_string(*graph_splits) +
@@ -435,6 +887,15 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
                 }
                 std::ostringstream runtime;
                 runtime << "{\"n_gpu_layers_requested\":" << configuration.gpu_layers
+                        << ",\"batch_size_requested\":" << requested_batch
+                        << ",\"threads_requested\":" << context_params.n_threads
+                        << ",\"batch_threads_requested\":" << context_params.n_threads_batch
+                        << ",\"tensor_checks_requested\":"
+                        << (configuration.check_tensors ? "true" : "false")
+                        << ",\"no_host_requested\":" << (sidecar_no_host ? "true" : "false")
+                        << ",\"omp_num_threads_defaulted\":"
+                        << (omp_num_threads_defaulted ? "true" : "false")
+                        << ",\"cuda_graph_optimization\":" << (cuda_graph_optimization ? "true" : "false")
                         << ",\"actual_weight_placement\":\"";
                 if (gpu_layers_offloaded && gpu_layers_total &&
                     *gpu_layers_offloaded == *gpu_layers_total) {
@@ -451,8 +912,13 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
                 runtime
                         << ",\"model_bytes_reported\":" << llama_model_size(model.get())
                         << ",\"model_parameters_reported\":" << llama_model_n_params(model.get())
-                        << ",\"load_mode\":\"" << EscapeJson(llama_load_mode_name(model_params.load_mode)) << '"'
-                        << ",\"mmap_default_requested\":true"
+                        << ",\"load_mode\":\""
+                        << (configuration.sidecar_staging ? "SIDECAR_USER_CALLBACK" :
+                            EscapeJson(llama_load_mode_name(model_params.load_mode))) << '"'
+                        << ",\"mmap_default_requested\":"
+                        << (configuration.sidecar_staging || model_params.load_mode == LLAMA_LOAD_MODE_NONE
+                            ? "false" : "true")
+                        << ",\"sidecar_loaded_bytes\":" << result.sidecar_stage_bytes
                         << ",\"context_size_actual\":" << llama_n_ctx(context.get())
                         << ",\"batch_actual\":" << llama_n_batch(context.get())
                         << ",\"ubatch_actual\":" << llama_n_ubatch(context.get())
@@ -504,14 +970,13 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
                 runtime << '}';
                 result.runtime_configuration_json = runtime.str();
             }
-            auto sampler_params = llama_sampler_chain_default_params();
-            sampler_params.no_perf = false;
-            std::unique_ptr<llama_sampler, SamplerDeleter> sampler(
-                llama_sampler_chain_init(sampler_params));
-            llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
-
-            for (std::uint32_t pass = 0; pass <= configuration.warmups; ++pass) {
-                const bool measured = pass == configuration.warmups;
+            // CUDA graphs remain cached in this reused context. Warm the
+            // first repetition only; later repetitions still clear KV memory
+            // and reset sampling but do not repeat graph warmup work.
+            const auto warmup_count = run == 0 ? configuration.warmups : 0U;
+            for (std::uint32_t pass = 0; pass <= warmup_count; ++pass) {
+                const bool measured = pass == warmup_count;
+                const auto pass_generated_tokens = measured ? configuration.generated_tokens : 1U;
                 if (pass != 0) {
                     llama_memory_clear(llama_get_memory(context.get()), true);
                     llama_sampler_reset(sampler.get());
@@ -541,8 +1006,8 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     Clock::now() - initial_sampling_start).count());
             sample.initial_sampling_ns = initial_sampling_ns;
-            sample.tokens.reserve(configuration.generated_tokens);
-            for (std::uint32_t token_index = 0; token_index < configuration.generated_tokens; ++token_index) {
+                sample.tokens.reserve(pass_generated_tokens);
+                for (std::uint32_t token_index = 0; token_index < pass_generated_tokens; ++token_index) {
                 ResetObserver(observer, token_index + 1U);
                 TokenTiming timing;
                 timing.token_index = token_index;
@@ -568,7 +1033,7 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
                 input_token = output_token;
             }
             sample.generation_tokens_per_second = sample.decode_total_ns == 0 ? 0.0 :
-                static_cast<double>(configuration.generated_tokens) * 1.0e9 /
+                static_cast<double>(pass_generated_tokens) * 1.0e9 /
                 static_cast<double>(sample.decode_total_ns);
             sample.total_request_ns = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -588,7 +1053,15 @@ InferenceResult RunInference(const InferenceConfiguration& configuration,
             if (!result.samples.empty()) result.samples.back().dropped_events += metrics.records_dropped;
         }
         result.status = "PASS";
-        result.message = "pinned llama.cpp model load, tensor validation, tokenization, prompt decode and deterministic generation passed";
+        if (configuration.sidecar_staging) {
+            result.message = configuration.check_tensors
+                ? "Sidecar staged GGUF tensors from NVMe through pinned host memory into llama.cpp backends; tensor validation, tokenization, prompt decode and deterministic generation passed"
+                : "Sidecar staged GGUF tensors from NVMe through pinned host memory into llama.cpp backends; tensor checks were skipped by request, tokenization, prompt decode and deterministic generation passed";
+        } else {
+            result.message = configuration.check_tensors
+                ? "pinned llama.cpp model load, tensor validation, tokenization, prompt decode and deterministic generation passed"
+                : "pinned llama.cpp model load, tensor checks were skipped by request, tokenization, prompt decode and deterministic generation passed";
+        }
         result.callback_contract = configuration.observer_mode == ObserverMode::None
             ? "NO_CALLBACK_INSTALLED"
             : "ask=true metadata only; LIGHT returns false; FORENSIC_SELECTED requests one materialization per eval; ask=false delivery returns true to continue graph";

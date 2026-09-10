@@ -134,6 +134,42 @@ struct MoeStaticProfile {
     bool selected_experts_observable{false};
 };
 
+// WU10A is deliberately a static gate. These inputs are explicit because a
+// machine's usable VRAM, measured transfer envelope, and usable lookahead are
+// experiment conditions rather than universal constants.
+struct OversizedFeasibilityInputs {
+    std::uint64_t usable_vram_bytes{0};
+    std::uint64_t h2d_bytes_per_second{0};
+    std::uint64_t compute_window_ns{0};
+    std::uint64_t staging_lead_time_ns{0};
+    std::uint32_t assumed_active_experts_per_layer{0};
+};
+
+struct OversizedFeasibilityResult {
+    std::string status{"INSUFFICIENT_INPUT"};
+    std::string evidence_class{"STATIC_NONAUTHORITATIVE"};
+    std::uint64_t persistent_weight_bytes{0};
+    std::uint64_t usable_vram_bytes{0};
+    std::uint64_t resident_weight_bytes{0};
+    std::uint64_t minimum_nonresident_bytes{0};
+    std::uint64_t candidate_h2d_bytes_per_token{0};
+    std::uint64_t theoretical_h2d_floor_ns{0};
+    std::int64_t compute_window_margin_ns{0};
+    std::int64_t staging_lead_margin_ns{0};
+    std::uint64_t moe_router_bytes{0};
+    std::uint64_t moe_expert_bytes_per_layer_estimate{0};
+    std::uint32_t assumed_active_experts_per_layer{0};
+    bool is_moe{false};
+    bool requires_runtime_demand{false};
+};
+
+struct ConventionalBaselinePlanEntry {
+    std::string baseline_id;
+    std::int32_t gpu_layers{0};
+    std::string purpose;
+    bool bounded_smoke_only{false};
+};
+
 struct ShadowDeadlineResult {
     KnowledgeMode knowledge{KnowledgeMode::Causal};
     std::uint64_t available_lead_time_ns{0};
@@ -181,12 +217,31 @@ struct InferenceConfiguration {
     std::uint32_t prompt_tokens{128};
     std::uint32_t generated_tokens{32};
     std::uint32_t context_size{4096};
+    // Optional context batch override; zero retains the historical 512-token default.
+    std::uint32_t batch_size{0};
+    // Optional CPU thread override; zero retains llama.cpp's default (4).
+    std::uint32_t threads{0};
+    // Optional separate thread count for prompt/batch evaluation; zero uses
+    // the single-token thread count.
+    std::uint32_t batch_threads{0};
+    bool offload_kqv{true};
+    bool op_offload{true};
     std::int32_t gpu_layers{-1};
     std::uint32_t seed{0x53494445U};
-    std::uint32_t warmups{1};
+    // Two unmeasured passes stabilize CUDA graph/allocator state before the
+    // first measured repetition; callers may explicitly request another
+    // count (including zero for cold-start diagnostics).
+    std::uint32_t warmups{2};
     std::uint32_t repetitions{1};
     ObserverMode observer_mode{ObserverMode::None};
     bool authoritative{false};
+    // Load model tensors through the Sidecar NVMe -> pinned-host -> backend
+    // staging callback instead of llama.cpp's normal mmap/file loader.
+    bool sidecar_staging{false};
+    // Tensor integrity checks are enabled by default.  Non-authoritative
+    // callers may disable them after independently verifying the GGUF to
+    // reduce model-load startup cost; authoritative runs must keep them on.
+    bool check_tensors{true};
     std::size_t event_capacity{1U << 20U};
     std::optional<std::filesystem::path> flight_recorder_path;
     std::string machine_hash;
@@ -231,6 +286,11 @@ struct InferenceResult {
     std::string callback_contract;
     std::string graph_split_detail{"BACKEND_DETAIL_UNAVAILABLE_PUBLIC_API"};
     std::string runtime_configuration_json{"{}"};
+    std::uint64_t sidecar_stage_read_ns{0};
+    std::uint64_t sidecar_stage_backend_copy_ns{0};
+    std::uint64_t sidecar_stage_bytes{0};
+    std::uint64_t sidecar_stage_gpu_bytes{0};
+    std::uint64_t sidecar_stage_tensor_count{0};
     std::optional<StorageProvenance> model_storage;
     std::vector<InferenceSample> samples;
 };
@@ -247,6 +307,10 @@ struct InferenceResult {
     const std::vector<TensorIndexEntry>& tensors);
 [[nodiscard]] MoeStaticProfile AnalyzeMoeStaticProfile(
     const ModelIndex& model, std::uint64_t capacity_bytes);
+[[nodiscard]] OversizedFeasibilityResult AnalyzeOversizedFeasibility(
+    const ModelIndex& model, const OversizedFeasibilityInputs& inputs);
+[[nodiscard]] std::vector<ConventionalBaselinePlanEntry> BuildConventionalBaselinePlan(
+    const ModelIndex& model);
 [[nodiscard]] std::vector<std::uint32_t> DeduplicateDemand(
     const std::vector<ObserverEvent32>& events);
 [[nodiscard]] ShadowDeadlineResult EvaluateShadowDeadline(

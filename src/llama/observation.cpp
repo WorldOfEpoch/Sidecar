@@ -80,6 +80,29 @@ double Quantile(std::vector<double> values, double q) {
     return values[low] + (values[high] - values[low]) * fraction;
 }
 
+std::uint64_t SaturatingAdd(std::uint64_t left, std::uint64_t right) noexcept {
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    return left > maximum - right ? maximum : left + right;
+}
+
+std::uint64_t SaturatingMultiply(std::uint64_t left, std::uint64_t right) noexcept {
+    if (left == 0 || right == 0) return 0;
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    return left > maximum / right ? maximum : left * right;
+}
+
+std::int64_t SignedMargin(std::uint64_t available, std::uint64_t required) noexcept {
+    const auto maximum = static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)());
+    if (available >= required) {
+        const auto margin = available - required;
+        return margin > maximum ? (std::numeric_limits<std::int64_t>::max)()
+                                : static_cast<std::int64_t>(margin);
+    }
+    const auto deficit = required - available;
+    return deficit > maximum ? (std::numeric_limits<std::int64_t>::min)()
+                             : -static_cast<std::int64_t>(deficit);
+}
+
 }  // namespace
 
 std::string_view ToString(ObserverMode mode) noexcept {
@@ -229,6 +252,126 @@ MoeStaticProfile AnalyzeMoeStaticProfile(const ModelIndex& model,
                 profile.estimated_bytes_per_expert;
     }
     return profile;
+}
+
+OversizedFeasibilityResult AnalyzeOversizedFeasibility(
+    const ModelIndex& model, const OversizedFeasibilityInputs& inputs) {
+    OversizedFeasibilityResult result;
+    result.is_moe = model.is_moe;
+    result.usable_vram_bytes = inputs.usable_vram_bytes;
+    result.assumed_active_experts_per_layer = inputs.assumed_active_experts_per_layer;
+
+    for (const auto& tensor : model.tensors) {
+        if (tensor.persistent_weight) {
+            result.persistent_weight_bytes = SaturatingAdd(result.persistent_weight_bytes,
+                                                            tensor.bytes);
+        }
+        if (tensor.role == "moe_router_weight") {
+            result.moe_router_bytes = SaturatingAdd(result.moe_router_bytes, tensor.bytes);
+        }
+    }
+    if (result.persistent_weight_bytes == 0) {
+        result.status = "NO_PERSISTENT_WEIGHT_BYTES";
+        return result;
+    }
+    if (inputs.usable_vram_bytes == 0) {
+        result.status = "INSUFFICIENT_USABLE_VRAM";
+        return result;
+    }
+
+    result.resident_weight_bytes = (std::min)(result.persistent_weight_bytes,
+                                              inputs.usable_vram_bytes);
+    result.minimum_nonresident_bytes = result.persistent_weight_bytes -
+                                       result.resident_weight_bytes;
+    if (result.minimum_nonresident_bytes == 0) {
+        result.status = "FULLY_RESIDENT_CONTROL_NOT_OVERSIZED";
+        return result;
+    }
+
+    if (model.is_moe) {
+        result.requires_runtime_demand = true;
+        const auto profile = AnalyzeMoeStaticProfile(model, inputs.usable_vram_bytes);
+        if (model.layer_count && *model.layer_count != 0 &&
+            inputs.assumed_active_experts_per_layer != 0) {
+            result.moe_expert_bytes_per_layer_estimate =
+                profile.estimated_bytes_per_expert / *model.layer_count;
+            result.candidate_h2d_bytes_per_token = SaturatingMultiply(
+                SaturatingMultiply(result.moe_expert_bytes_per_layer_estimate,
+                                   inputs.assumed_active_experts_per_layer),
+                *model.layer_count);
+        }
+        result.status = result.candidate_h2d_bytes_per_token == 0
+            ? "MOE_STATIC_LAYOUT_NEEDS_ACTIVE_EXPERT_ASSUMPTION"
+            : "MOE_STATIC_LAYOUT_NEEDS_RUNTIME_DEMAND";
+    } else {
+        // A dense model normally consumes every persistent layer for each token.
+        // The nonresident weight set is therefore a hard lower-bound candidate
+        // for recurring H2D traffic, before cache/reuse details are measured.
+        result.candidate_h2d_bytes_per_token = result.minimum_nonresident_bytes;
+        result.status = "DENSE_STATIC_FEASIBILITY_ONLY";
+    }
+
+    if (inputs.h2d_bytes_per_second == 0 || result.candidate_h2d_bytes_per_token == 0) {
+        return result;
+    }
+    const long double floor_ns = std::ceil(
+        static_cast<long double>(result.candidate_h2d_bytes_per_token) *
+        1'000'000'000.0L / static_cast<long double>(inputs.h2d_bytes_per_second));
+    result.theoretical_h2d_floor_ns =
+        floor_ns >= static_cast<long double>((std::numeric_limits<std::uint64_t>::max)())
+        ? (std::numeric_limits<std::uint64_t>::max)()
+        : static_cast<std::uint64_t>(floor_ns);
+    if (inputs.compute_window_ns != 0) {
+        result.compute_window_margin_ns = SignedMargin(inputs.compute_window_ns,
+                                                       result.theoretical_h2d_floor_ns);
+    }
+    if (inputs.staging_lead_time_ns != 0) {
+        result.staging_lead_margin_ns = SignedMargin(inputs.staging_lead_time_ns,
+                                                     result.theoretical_h2d_floor_ns);
+    }
+    if (!model.is_moe &&
+        ((inputs.compute_window_ns != 0 && result.compute_window_margin_ns < 0) ||
+         (inputs.staging_lead_time_ns != 0 && result.staging_lead_margin_ns < 0))) {
+        result.status = "DENSE_STATIC_BANDWIDTH_LIMITED";
+    } else if (!model.is_moe && inputs.compute_window_ns != 0 &&
+               inputs.staging_lead_time_ns != 0) {
+        result.status = "DENSE_STATICALLY_PLAUSIBLE_NEEDS_RUNTIME_VALIDATION";
+    }
+    return result;
+}
+
+std::vector<ConventionalBaselinePlanEntry> BuildConventionalBaselinePlan(
+    const ModelIndex& model) {
+    const auto layers = model.layer_count.value_or(0);
+    std::vector<ConventionalBaselinePlanEntry> result{
+        {"CPU_ONLY", 0,
+         "Reference floor with all model work on CPU/RAM; use a bounded smoke run if it is impractically slow.",
+         true},
+    };
+    if (layers != 0) {
+        const auto add_partial = [&result, layers](std::uint32_t numerator,
+                                                    std::string_view label) {
+            const auto requested = (std::max)(1U, (layers * numerator) / 4U);
+            const bool already_present = std::any_of(
+                result.begin(), result.end(), [requested](const auto& entry) {
+                    return entry.gpu_layers == static_cast<std::int32_t>(requested);
+                });
+            if (already_present) return;
+            result.push_back({std::string(label), static_cast<std::int32_t>(requested),
+                              "Conventional llama.cpp partial GPU-offload control; record actual offload and memory use.",
+                              false});
+        };
+        add_partial(1, "PARTIAL_OFFLOAD_25_PERCENT");
+        add_partial(2, "PARTIAL_OFFLOAD_50_PERCENT");
+        add_partial(3, "PARTIAL_OFFLOAD_75_PERCENT");
+    }
+    result.push_back({"FULL_GPU_REQUEST", -1,
+                      "Full conventional GPU-offload request; expected to fail for an oversized model and is a capacity control.",
+                      true});
+    result.push_back({"MAX_STABLE_CONVENTIONAL", -2,
+                      "Execution placeholder: resolve only after the partial-offload sweep identifies the largest stable conventional configuration.",
+                      false});
+    return result;
 }
 
 std::vector<std::uint32_t> DeduplicateDemand(const std::vector<ObserverEvent32>& events) {
@@ -620,6 +763,11 @@ std::string InferenceResultToJson(const InferenceResult& result) {
            << ",\"callback_contract\":\"" << Escape(result.callback_contract)
            << "\",\"graph_split_detail\":\"" << Escape(result.graph_split_detail)
            << "\",\"runtime_configuration\":" << result.runtime_configuration_json
+           << ",\"sidecar_staging\":{\"read_ns\":" << result.sidecar_stage_read_ns
+           << ",\"backend_copy_ns\":" << result.sidecar_stage_backend_copy_ns
+           << ",\"bytes\":" << result.sidecar_stage_bytes
+           << ",\"gpu_bytes\":" << result.sidecar_stage_gpu_bytes
+           << ",\"tensor_count\":" << result.sidecar_stage_tensor_count << "}"
            << ",\"samples\":[";
     for (std::size_t sample_index = 0; sample_index < result.samples.size(); ++sample_index) {
         if (sample_index != 0) output << ',';

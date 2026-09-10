@@ -84,6 +84,64 @@ void TestProjectionAndDemand() {
            moe_profile.estimated_bytes_per_expert == 100 &&
            moe_profile.candidate_experts_in_capacity == 2 &&
            !moe_profile.selected_experts_observable, "MoE static-only classification");
+
+    ModelIndex dense;
+    TensorIndexEntry dense_weights; dense_weights.bytes = 300; dense_weights.persistent_weight = true;
+    dense.tensors = {dense_weights};
+    OversizedFeasibilityInputs limited;
+    limited.usable_vram_bytes = 100;
+    limited.h2d_bytes_per_second = 100;
+    limited.compute_window_ns = 1'000'000'000ULL;
+    limited.staging_lead_time_ns = 3'000'000'000ULL;
+    const auto dense_limited = AnalyzeOversizedFeasibility(dense, limited);
+    Expect(dense_limited.minimum_nonresident_bytes == 200 &&
+           dense_limited.candidate_h2d_bytes_per_token == 200 &&
+           dense_limited.theoretical_h2d_floor_ns == 2'000'000'000ULL &&
+           dense_limited.status == "DENSE_STATIC_BANDWIDTH_LIMITED",
+           "dense feasibility identifies a recurring nonresident bandwidth floor");
+
+    limited.h2d_bytes_per_second = 1'000;
+    limited.compute_window_ns = 300'000'000ULL;
+    limited.staging_lead_time_ns = 300'000'000ULL;
+    const auto dense_plausible = AnalyzeOversizedFeasibility(dense, limited);
+    Expect(dense_plausible.status == "DENSE_STATICALLY_PLAUSIBLE_NEEDS_RUNTIME_VALIDATION" &&
+           dense_plausible.compute_window_margin_ns == 100'000'000LL,
+           "dense feasibility keeps a positive result nonauthoritative");
+
+    ModelIndex large_dense;
+    TensorIndexEntry large_weights;
+    large_weights.bytes = 50'000'000'000ULL;
+    large_weights.persistent_weight = true;
+    large_dense.tensors = {large_weights};
+    OversizedFeasibilityInputs large_inputs;
+    large_inputs.usable_vram_bytes = 25'000'000'000ULL;
+    large_inputs.h2d_bytes_per_second = 25'000'000'000ULL;
+    large_inputs.compute_window_ns = 64'000'000ULL;
+    const auto large_result = AnalyzeOversizedFeasibility(large_dense, large_inputs);
+    Expect(large_result.candidate_h2d_bytes_per_token == 25'000'000'000ULL &&
+           large_result.theoretical_h2d_floor_ns == 1'000'000'000ULL &&
+           large_result.status == "DENSE_STATIC_BANDWIDTH_LIMITED",
+           "large dense transfer floor avoids 64-bit numerator overflow");
+
+    moe.layer_count = 2;
+    OversizedFeasibilityInputs moe_inputs;
+    moe_inputs.usable_vram_bytes = 50;
+    moe_inputs.h2d_bytes_per_second = 1'000;
+    moe_inputs.assumed_active_experts_per_layer = 2;
+    const auto moe_feasibility = AnalyzeOversizedFeasibility(moe, moe_inputs);
+    Expect(moe_feasibility.requires_runtime_demand &&
+           moe_feasibility.moe_expert_bytes_per_layer_estimate == 50 &&
+           moe_feasibility.candidate_h2d_bytes_per_token == 200 &&
+           moe_feasibility.status == "MOE_STATIC_LAYOUT_NEEDS_RUNTIME_DEMAND",
+           "MoE feasibility never promotes static assumptions to demand evidence");
+    ModelIndex plan_model = moe;
+    plan_model.layer_count = 4;
+    const auto plan = BuildConventionalBaselinePlan(plan_model);
+    Expect(plan.size() == 6 && plan.front().gpu_layers == 0 &&
+           plan[1].gpu_layers == 1 && plan[2].gpu_layers == 2 &&
+           plan[3].gpu_layers == 3 && plan[4].gpu_layers == -1 &&
+           plan[5].gpu_layers == -2,
+           "conventional baseline plan includes CPU, partial, full-request, and max-stable controls");
 }
 
 void TestShadowAndOverhead() {

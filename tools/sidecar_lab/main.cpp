@@ -68,7 +68,7 @@ void PrintUsage() {
         << "  sidecar-lab storage info|health|plan|run|matrix|deadline|report|validate [filters]\n"
         << "  sidecar-lab storage dataset create|verify [--full] [--json]\n"
         << "  sidecar-lab pipeline info|host-copy|plan|baseline|run|matrix|stream|report|validate [filters]\n";
-    std::cout << "  sidecar-lab llama info|model|baseline|observe|overhead|demand|shadow|report|validate [filters]\n";
+    std::cout << "  sidecar-lab llama info|model|baseline|sidecar|observe|overhead|demand|shadow|report|validate [filters]\n";
 }
 
 std::filesystem::path DatabasePath(int argc, char** argv) {

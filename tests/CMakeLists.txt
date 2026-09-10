@@ -197,6 +197,12 @@ add_test(NAME sidecar.cli.storage_plan
                  --pattern sequential --block 1M --qd 1 --json)
 add_test(NAME sidecar.cli.pipeline_info COMMAND sidecar-lab pipeline info --json)
 add_test(NAME sidecar.cli.llama_info COMMAND sidecar-lab llama info --json)
+add_test(NAME sidecar.cli.llama_authoritative_tensor_guard
+         COMMAND sidecar-lab llama baseline --model
+                 "C:/Sidecar/test-fixtures/not-a-real-model.gguf"
+                 --authoritative --no-tensor-checks --json)
+set_tests_properties(sidecar.cli.llama_authoritative_tensor_guard
+    PROPERTIES WILL_FAIL TRUE)
 add_test(NAME sidecar.cli.llama_shadow COMMAND sidecar-lab llama shadow
          --causal-lead-ns 10 --oracle-lead-ns 100 --pipeline-ns 50 --json)
 add_test(NAME sidecar.cli.pipeline_plan

@@ -16,6 +16,15 @@ set(SIDECAR_LLAMA_CPP_ROOT "C:/SidecarDeps/llama.cpp" CACHE PATH
     "Pinned official llama.cpp checkout")
 set(SIDECAR_LLAMA_CPP_BUILD_DIR "C:/SidecarDeps/llama.cpp/build-sidecar" CACHE PATH
     "Prebuilt pinned llama.cpp CMake build directory")
+set(SIDECAR_LLAMA_CUDA_KERNEL_POLICY "DEFAULT" CACHE STRING
+    "CUDA kernel policy used by the pinned llama.cpp build (DEFAULT, CUBLAS, or MMQ)")
+set_property(CACHE SIDECAR_LLAMA_CUDA_KERNEL_POLICY PROPERTY STRINGS DEFAULT CUBLAS MMQ)
+if(NOT SIDECAR_LLAMA_CUDA_KERNEL_POLICY STREQUAL "DEFAULT" AND
+   NOT SIDECAR_LLAMA_CUDA_KERNEL_POLICY STREQUAL "CUBLAS" AND
+   NOT SIDECAR_LLAMA_CUDA_KERNEL_POLICY STREQUAL "MMQ")
+    message(FATAL_ERROR
+        "SIDECAR_LLAMA_CUDA_KERNEL_POLICY must be DEFAULT, CUBLAS, or MMQ")
+endif()
 
 set(SIDECAR_SPEC_VERSION "M0-FROZEN-1")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SIDECAR_VERSION)
@@ -205,7 +214,8 @@ if(SIDECAR_ENABLE_LLAMA)
         sidecar_llama_runtime sidecar_ggml_runtime sidecar_ggml_base_runtime)
     target_compile_definitions(sidecar_core PUBLIC SIDECAR_LLAMA_ENABLED=1)
     if(SIDECAR_ENABLE_CUDA)
-        set(SIDECAR_LLAMA_BUILD_CONFIGURATION "Release-GGML_CUDA-sm86")
+        set(SIDECAR_LLAMA_BUILD_CONFIGURATION
+            "Release-GGML_CUDA-sm86-${SIDECAR_LLAMA_CUDA_KERNEL_POLICY}")
         set(SIDECAR_LLAMA_CUDA_TOOLKIT_VERSION "${CUDAToolkit_VERSION}")
     else()
         set(SIDECAR_LLAMA_BUILD_CONFIGURATION "Release-GGUF-inspection-CUDA-disabled-Sidecar")
